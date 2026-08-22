@@ -22,6 +22,7 @@ import sys
 
 import fastf1
 
+from build_driver_features import load_features
 from FastF1_Data_Driven_Simulations import load_data, extract_tire_deg
 from track_config import key_for, laps_for, overtake_for, TRACK_LAPS
 
@@ -29,6 +30,27 @@ from track_config import key_for, laps_for, overtake_for, TRACK_LAPS
 os.makedirs("tracks", exist_ok=True)
 
 YEAR = 2025
+
+# --------------------------------------------------------------
+# GUARD: driver ratings must exist first
+#
+# Without them every driver gets an identical rating, and the races
+# you precompute will be meaningless. Fail loudly rather than
+# quietly writing 24 useless pickles.
+# --------------------------------------------------------------
+if load_features() is None:
+    print("=" * 62)
+    print("MISSING: features/driver_features.pkl")
+    print()
+    print("Driver form, team strength, qualifying and DNF rates have")
+    print("not been built yet. Without them every driver would be")
+    print("rated identically and the precomputed races would be")
+    print("meaningless.")
+    print()
+    print("Build them once with:")
+    print("    python build_driver_features.py")
+    print("=" * 62)
+    sys.exit(1)
 
 
 # --------------------------------------------------------------

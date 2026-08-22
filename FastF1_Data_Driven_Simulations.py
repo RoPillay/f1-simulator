@@ -490,47 +490,76 @@ def load_data(track = "Bahrain"):
         if pd.isna(row["LapVar"]):
             df.loc[i, "LapVar"] = team_avg.loc[row["Team"], "LapVar"]
 
-    # FEATURES
-    # --- Qualifying ---
-    # quali_map = compute_quali_score()
-    quali_map = {}
-    df["QualiScore"] = df["Driver"].map(quali_map)
-    df["QualiScore"] = df["QualiScore"].fillna(df["QualiScore"].mean())
-    df["QualiScore"] = -df["QualiScore"]
-    df["QualiScore"] = zscore(df["QualiScore"])
+    # ==========================================================
+    # FEATURES (REAL STATISTICS)
+    #
+    # These maps are global -- driver/team properties, not track
+    # properties -- so they are built once by build_driver_features.py
+    # and cached. Recomputing them per track meant ~300 session loads
+    # per circuit, which is why they were previously disabled.
+    # ==========================================================
+    from build_driver_features import load_features
 
-    # --- Driver Form ---
-    # driver_form_map = compute_driver_form()
-    driver_form_map = {}
-    df["DriverForm"] = df["Driver"].map(driver_form_map)
-    df["DriverForm"] = df["DriverForm"].fillna(df["DriverForm"].mean())
-    df["DriverForm"] = zscore(df["DriverForm"])
-    df["DriverForm"] = np.clip(df["DriverForm"], -1.5, 1.5)
+    feats = load_features()
 
-    # --- Race Performance ---
-    # race_perf_map = compute_race_performance()
-    race_perf_map = {}
-    df["RacePerf"] = df["Driver"].map(race_perf_map)
-    df["RacePerf"] = df["RacePerf"].fillna(df["RacePerf"].mean())
-    df["RacePerf"] = -df["RacePerf"]
-    df["RacePerf"] = zscore(df["RacePerf"])
+    if feats is None:
+        print(
+            "\n!! features/driver_features.pkl not found."
+            "\n!! Driver ratings will be NEUTRAL -- every driver identical."
+            "\n!! Build them with:  python build_driver_features.py\n"
+        )
+        feats = {}
 
-    # --- Team Strength ---
-    # team_strength_map = compute_team_strength()
-    team_strength_map = {}
-    print("\nDEBUG: Team Strength Ranking")
-    print(sorted(team_strength_map.items(), key=lambda x: x[1], reverse=True))
-    df["TeamStrength"] = df["Team"].map(team_strength_map)
-    df["TeamStrength"] = df["TeamStrength"].fillna(df["TeamStrength"].mean())
-    df["TeamStrength"] = zscore(df["TeamStrength"])
+    quali_map = feats.get("quali_score", {})
+    driver_form_map = feats.get("driver_form", {})
+    race_perf_map = feats.get("race_perf", {})
+    team_strength_map = feats.get("team_strength", {})
+    dnf_map = feats.get("dnf_rates", {})
 
-    # --- Track Pace ---
+    # -----------------------------
+    # TRACK ANCHOR
+    #
+    # Captured BEFORE TrackPace is z-scored, because we need the real
+    # lap time in seconds to place the field at the right absolute
+    # pace for this circuit (Monaco ~72s, Spa ~105s -- not a flat 95).
+    # -----------------------------
+    track_anchor = float(df["TrackPace"].median())
+
+    def _feature(col, mapping, invert=False):
+        """Map a raw feature in, fill gaps with the field mean, z-score."""
+
+        s = df["Driver"].map(mapping) if col != "TeamStrength" else df["Team"].map(mapping)
+
+        if s.notna().sum() == 0:
+            # nothing known -- neutral, so it contributes nothing
+            return pd.Series(0.0, index=df.index)
+
+        s = s.fillna(s.mean())
+
+        if invert:
+            s = -s
+
+        return zscore(s)
+
+    # --- Qualifying (lower time = better) ---
+    df["QualiScore"] = _feature("QualiScore", quali_map, invert=True)
+
+    # --- Driver Form (more points = better) ---
+    df["DriverForm"] = np.clip(_feature("DriverForm", driver_form_map), -1.5, 1.5)
+
+    # --- Race Performance (lower finishing position = better) ---
+    df["RacePerf"] = _feature("RacePerf", race_perf_map, invert=True)
+
+    # --- Team Strength (more points = better) ---
+    df["TeamStrength"] = _feature("TeamStrength", team_strength_map)
+
+    # --- Track Pace (lower lap time = better) ---
     df["TrackPace"] = df["TrackPace"].fillna(df["TrackPace"].mean())
     df["TrackPace"] = zscore(df["TrackPace"])
 
-    print("\nDEBUG: Driver + TeamStrength")
-    print(df[["Driver", "Team", "TeamStrength"]].sort_values("TeamStrength", ascending=False))
+    # -----------------------------
     # FINAL PACE
+    # -----------------------------
     df["Pace"] = (
         0.05 * (-df["TrackPace"]) +
         0.25 * df["QualiScore"] +
@@ -538,6 +567,7 @@ def load_data(track = "Bahrain"):
         0.28 * df["TeamStrength"] +
         0.27 * df["RacePerf"]
     )
+
     driver_offsets = {
         "VER": 0.045,
         "NOR": 0.035,
@@ -549,20 +579,52 @@ def load_data(track = "Bahrain"):
 
     df["Pace"] += df["Driver"].map(driver_offsets).fillna(0)
 
-    df["Pace"] = np.clip(df["Pace"], -1.2, 1.2)
+    # Wide enough that it effectively never binds. The old -1.2/+1.2
+    # clip saturated for the front-runners, handing the top three an
+    # identical baseline and erasing the differences that matter most.
+    df["Pace"] = np.clip(df["Pace"], -2.5, 2.5)
 
-    # df["Baseline"] = 95 + (-df["Pace"] * 0.8)
-    # TEMP BASELINE (FAST TEST MODE)
-    df["Baseline"] = 95 + np.random.uniform(-1, 1, len(df))
-    df["LapVar"] = 0.3
-    df["DNFProb"] = 0.02
-    print("\nDEBUG: Baseline Pace (lower = faster)")
-    print(df[["Driver", "Baseline"]].sort_values("Baseline"))
+    # -----------------------------
+    # BASELINE LAP TIME
+    #
+    # Anchored to this circuit's real median lap time, then spread by
+    # the composite pace rating. Higher Pace = faster = lower time.
+    # -----------------------------
+    df["Baseline"] = track_anchor + (-df["Pace"] * 0.8)
 
-    # DNF
-    # dnf = compute_dnf_rates()
-    dnf = {}
-    # df["DNFProb"] = df["Driver"].map(dnf).fillna(0.03)
+    # -----------------------------
+    # LAP TIME VARIABILITY (measured per driver at this track)
+    #
+    # Raw values are the std of a driver's lap times, which sit well
+    # above the range the engine expects -- clipping them made every
+    # driver identical. Rescale instead, so the measured differences
+    # in consistency survive.
+    # -----------------------------
+    df["LapVar"] = df["LapVar"].fillna(df["LapVar"].mean())
+
+    lv_min, lv_max = df["LapVar"].min(), df["LapVar"].max()
+
+    if lv_max - lv_min > 1e-9:
+        df["LapVar"] = 0.18 + (df["LapVar"] - lv_min) / (lv_max - lv_min) * (0.42 - 0.18)
+    else:
+        df["LapVar"] = 0.30
+
+    # -----------------------------
+    # DNF PROBABILITY (per race, converted per lap inside F1Env)
+    # -----------------------------
+    df["DNFProb"] = df["Driver"].map(dnf_map)
+    df["DNFProb"] = df["DNFProb"].fillna(
+        np.nanmean(list(dnf_map.values())) if dnf_map else 0.05
+    )
+    df["DNFProb"] = df["DNFProb"].clip(0.0, 0.5)
+
+    print("\nDEBUG: Baseline pace (lower = faster)")
+    print(
+        df[["Driver", "Team", "Baseline", "LapVar", "DNFProb"]]
+        .sort_values("Baseline")
+        .to_string(index=False)
+    )
+
 
     # SC PROB
     sc_prob = sc_count / race_counter
