@@ -1,79 +1,80 @@
 # ==============================================================
-# PRECOMPUTE ALL TRACK DATA (FINAL VERSION)
+# PRECOMPUTE ALL TRACK DATA
+# ==============================================================
+#
+# Writes one tracks/<EventName>.pkl per race.
+#
+# IMPORTANT: files are saved under FastF1's OWN EventName, which is
+# exactly what the app's dropdown shows. Per-circuit parameters are
+# looked up through track_config.key_for() instead, so nicknames
+# resolve correctly without the filename ever drifting from the name
+# the app asks for.
+#
+# Usage:
+#   python precomputing_track_data.py                  # all races
+#   python precomputing_track_data.py Bahrain Monaco   # just these
+#
 # ==============================================================
 
-import pickle
-import fastf1
-from FastF1_Data_Driven_Simulations import load_data, extract_tire_deg
 import os
+import pickle
+import sys
+
+import fastf1
+
+from FastF1_Data_Driven_Simulations import load_data, extract_tire_deg
+from track_config import key_for, laps_for, overtake_for, TRACK_LAPS
 
 # Create folder
 os.makedirs("tracks", exist_ok=True)
 
 YEAR = 2025
 
-# Load schedule (ALL races)
-schedule = fastf1.get_event_schedule(YEAR)
 
 # --------------------------------------------------------------
-# TRACK-SPECIFIC PARAMETERS (ALL TRACKS COVERED AUTOMATICALLY)
+# BUILD THE RACE LIST
+#
+# include_testing=False matters: pre-season test events carry no
+# race session and would fail every time.
 # --------------------------------------------------------------
+schedule = fastf1.get_event_schedule(YEAR, include_testing=False)
 
-TRACK_OVERTAKE = {
-    "Monaco Grand Prix": 0.15,
-    "Singapore Grand Prix": 0.3,
-    "Hungarian Grand Prix": 0.35,
-    "Imola Grand Prix": 0.4,
-    "Zandvoort Grand Prix": 0.45,
-    "Las Vegas Grand Prix": 0.6,
-    "Italian Grand Prix": 0.9,
-    "Azerbaijan Grand Prix": 0.85,
-    "Bahrain Grand Prix": 0.65,
-    "British Grand Prix": 0.75,
-    "Saudi Arabian Grand Prix": 0.7,
-    "Australian Grand Prix": 0.7,
-    "Japanese Grand Prix": 0.6,
-    "Spanish Grand Prix": 0.6,
-    "Canadian Grand Prix": 0.8,
-    "Austrian Grand Prix": 0.75,
-    "Belgian Grand Prix": 0.8,
-    "Dutch Grand Prix": 0.45,
-    "United States Grand Prix": 0.75,
-    "Mexico City Grand Prix": 0.7,
-    "Brazilian Grand Prix": 0.7,
-    "Qatar Grand Prix": 0.7,
-    "Abu Dhabi Grand Prix": 0.65,
-    "Chinese Grand Prix": 0.7
-}
+# optional CLI filter: match on any substring of the event name
+wanted = [a.lower() for a in sys.argv[1:]]
+
+if wanted:
+    schedule = schedule[
+        schedule["EventName"].str.lower().apply(
+            lambda n: any(w in n for w in wanted)
+        )
+    ]
+    print(f"Filtering to {len(schedule)} race(s) matching {wanted}")
+
+print(f"Precomputing {len(schedule)} race(s) for {YEAR}\n")
+
+ok, failed = [], []
 
 # --------------------------------------------------------------
 # MAIN LOOP
 # --------------------------------------------------------------
-test_tracks = [
-    "Bahrain Grand Prix"
-]
-schedule = schedule[schedule["EventName"].isin(test_tracks)]
-
 for _, row in schedule.iterrows():
-    # Fix naming differences between FastF1 and our dict
-    name_map = {
-        "Sao Paulo Grand Prix": "Brazilian Grand Prix",
-        "Emilia Romagna Grand Prix": "Imola Grand Prix",
-        "Dutch Grand Prix": "Zandvoort Grand Prix"
-    }
 
-    race_name = name_map.get(row["EventName"], row["EventName"])
+    # save under FastF1's own name -- this is what the app looks up
+    event_name = row["EventName"]
 
     try:
-        print(f"\n=== Processing {race_name} ===", flush=True)
+        print(f"=== Processing {event_name} ===", flush=True)
 
-        # 🔥 THIS IS THE KEY FIX
-        df, sc, vsc = load_data(track=race_name)
-        deg = extract_tire_deg(track=race_name)
+        df, sc, vsc = load_data(track=event_name)
+        deg = extract_tire_deg(track=event_name)
 
-        # Track-specific parameters
+        laps = laps_for(event_name)
+
+        if key_for(event_name) not in TRACK_LAPS:
+            print(f"  ! no lap count known for '{key_for(event_name)}', using {laps}")
+
         track_params = {
-            "overtake": TRACK_OVERTAKE.get(race_name, 0.6)
+            "overtake": overtake_for(event_name),
         }
 
         data = {
@@ -81,17 +82,28 @@ for _, row in schedule.iterrows():
             "sc": sc,
             "vsc": vsc,
             "deg": deg,
-            # "laps": row["TotalLaps"],
-            "laps": 57,
-            "track_params": track_params
+            "laps": laps,
+            "track_params": track_params,
         }
 
-        filename = f"tracks/{race_name}.pkl"
-
-        with open(filename, "wb") as f:
+        with open(f"tracks/{event_name}.pkl", "wb") as f:
             pickle.dump(data, f)
 
-        print(f"Saved {race_name}")
+        print(f"  saved  ({laps} laps, overtake {track_params['overtake']})")
+        ok.append(event_name)
 
     except Exception as e:
-        print(f"Skipped {race_name}: {e}")
+        print(f"  SKIPPED: {type(e).__name__}: {e}")
+        failed.append((event_name, f"{type(e).__name__}: {e}"))
+
+# --------------------------------------------------------------
+# SUMMARY
+# --------------------------------------------------------------
+print("\n" + "=" * 60)
+print(f"DONE: {len(ok)} succeeded, {len(failed)} failed")
+print("=" * 60)
+
+if failed:
+    print("\nFailed races:")
+    for name, err in failed:
+        print(f"  {name}: {err}")

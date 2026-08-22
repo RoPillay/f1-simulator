@@ -1,9 +1,19 @@
 # ==============================================================
-# F1 ENVIRONMENT (STEP-BASED SIMULATOR FOR UI + RL)
+# F1 ENVIRONMENT (LAP-BASED SIMULATOR FOR UI + RL)
+# ==============================================================
+#
+# ONE call to step() == ONE racing lap.
+#
+# Track position is NOT tracked separately -- it is derived from
+# each car's accumulated race time (see positions_at). That keeps
+# the cars drawn on the circuit in exactly the same order as the
+# timing screen, and makes real time gaps show up as real spacing.
+#
 # ==============================================================
 
+import bisect
 import numpy as np
-import random
+
 
 # ==============================================================
 # ENVIRONMENT CLASS
@@ -11,7 +21,7 @@ import random
 
 class F1Env:
 
-    def __init__(self, df, sc_prob, vsc_prob, deg_model):
+    def __init__(self, df, sc_prob, vsc_prob, deg_model, total_laps=57):
 
         # -----------------------------
         # DATA
@@ -28,6 +38,7 @@ class F1Env:
         self.dnf = df["DNFProb"].values
 
         self.n = len(self.drivers)
+        self.total_laps = total_laps
 
         # -----------------------------
         # TIRE MODEL (same structure as your sim)
@@ -61,7 +72,23 @@ class F1Env:
         self.overtake_distance = 2.0
         self.track_overtake_factor = 0.65
         self.failed_overtake_penalty = 0.1
-        self.track_temp = 35  # Bahrain typical (°C)
+        self.track_temp = 35  # Bahrain typical (deg C)
+
+        # -----------------------------
+        # SAFETY CAR LAP TIMES
+        # -----------------------------
+        self.sc_lap_time = 130.0
+        self.vsc_lap_time = 115.0
+
+        # -----------------------------
+        # SANITY GUARD ONLY (seconds around base pace)
+        #
+        # This is NOT a degradation cap -- degradation and the tire
+        # cliff are allowed to express fully. It exists purely to
+        # stop a numerical blow-up producing a nonsense lap time.
+        # -----------------------------
+        self.lap_time_floor = -2.0
+        self.lap_time_ceiling = 15.0
 
     # ==========================================================
     # RESET (START NEW RACE)
@@ -86,9 +113,19 @@ class F1Env:
         self.fresh = np.zeros(self.n)
 
         # -----------------------------
-        # LAP PROGRESS (0 → 1)
+        # LAP COMPLETION HISTORY
+        #
+        # completion_times[i][k] = race time at which car i crossed
+        # the line to complete lap k+1. This is what positions_at
+        # interpolates between to place cars on the circuit.
         # -----------------------------
-        self.lap_progress = np.zeros(self.n)
+        self.completion_times = [[] for _ in range(self.n)]
+
+        # laps completed at the moment a car retired (None = running)
+        self.retired_at = [None] * self.n
+
+        # race clock used for rendering (leader's elapsed time)
+        self.race_clock = 0.0
 
         # -----------------------------
         # DRIVER STYLE (push vs save)
@@ -106,7 +143,20 @@ class F1Env:
         return self._get_state()
 
     # ==========================================================
-    # STEP (ONE LAP)
+    # DRS COVERAGE
+    # ==========================================================
+    def _drs_coverage(self):
+        """Fraction of the lap that sits inside a DRS zone."""
+
+        if not self.drs_zones:
+            return 0.0
+
+        total = sum(max(0.0, end - start) for start, end in self.drs_zones)
+
+        return float(np.clip(total, 0.0, 1.0))
+
+    # ==========================================================
+    # STEP (ONE FULL LAP)
     # ==========================================================
     def step(self, actions):
         """
@@ -116,24 +166,19 @@ class F1Env:
         2 = pit medium
         3 = pit hard
         """
-        
+
         lap_times = np.zeros(self.n)
         overtake_events = []
 
         # -----------------------------
-        # DNF CHECK
-        # -----------------------------
-        for i in range(self.n):
-            if np.random.rand() < self.dnf[i] / 57:
-                self.total_time[i] = np.inf
-
-        # -----------------------------
         # SAFETY CAR / VSC
         # -----------------------------
-       # SAFETY CAR LOGIC
         if self.safety_timer > 0:
             safety = self.safety_active
             self.safety_timer -= 1
+
+            if self.safety_timer == 0:
+                self.safety_active = None
         else:
             safety = None
 
@@ -148,33 +193,43 @@ class F1Env:
                 safety = "VSC"
 
         # -----------------------------
-        # APPLY ACTIONS (PITS)
+        # DNF CHECK (ONCE PER LAP)
+        #
+        # dnf[i] is a whole-race probability, so convert it to the
+        # equivalent per-lap hazard rather than rolling it raw.
         # -----------------------------
         for i in range(self.n):
 
             if not np.isfinite(self.total_time[i]):
                 continue
 
-            if actions[i] == 1:
-                self.compounds[i] = "Soft"
-                self.stint_laps[i] = 0
-                self.total_time[i] += np.random.normal(self.pit_mean, self.pit_sd)
-                self.fresh[i] = 3
+            race_p = float(np.clip(self.dnf[i], 0.0, 0.99))
+            lap_p = 1.0 - (1.0 - race_p) ** (1.0 / max(self.total_laps, 1))
 
-            elif actions[i] == 2:
-                self.compounds[i] = "Medium"
-                self.stint_laps[i] = 0
-                self.total_time[i] += np.random.normal(self.pit_mean, self.pit_sd)
-                self.fresh[i] = 3
-
-            elif actions[i] == 3:
-                self.compounds[i] = "Hard"
-                self.stint_laps[i] = 0
-                self.total_time[i] += np.random.normal(self.pit_mean, self.pit_sd)
-                self.fresh[i] = 3
+            if np.random.rand() < lap_p:
+                self.total_time[i] = np.inf
+                self.retired_at[i] = len(self.completion_times[i])
 
         # -----------------------------
-        # LAP SIMULATION
+        # APPLY ACTIONS (PITS)
+        # -----------------------------
+        pit_loss = np.zeros(self.n)
+
+        for i in range(self.n):
+
+            if not np.isfinite(self.total_time[i]):
+                continue
+
+            if actions[i] in (1, 2, 3):
+
+                self.compounds[i] = {1: "Soft", 2: "Medium", 3: "Hard"}[actions[i]]
+                self.stint_laps[i] = 0
+                self.fresh[i] = 3
+
+                pit_loss[i] = np.random.normal(self.pit_mean, self.pit_sd)
+
+        # -----------------------------
+        # LAP SIMULATION (GREEN FLAG PACE)
         # -----------------------------
         for i in range(self.n):
 
@@ -202,7 +257,7 @@ class F1Env:
             deg_effect += 0.0015 * (age ** 2)
 
             # -----------------------------
-            # COMPOUND-SPECIFIC BEHAVIOR
+            # COMPOUND-SPECIFIC BEHAVIOR (THE CLIFF)
             # -----------------------------
             if compound == "Soft":
                 if age > 10:
@@ -252,44 +307,36 @@ class F1Env:
                 lap_time -= 0.4
                 self.fresh[i] -= 1
 
-            # safety car override
-            if safety == "SC":
-                lap_time = 130
-            elif safety == "VSC":
-                lap_time = 115
+            # sanity guard only -- the cliff above is left intact
+            lap_time = float(np.clip(
+                lap_time,
+                self.base[i] + self.lap_time_floor,
+                self.base[i] + self.lap_time_ceiling
+            ))
 
             lap_times[i] = lap_time
             self.stint_laps[i] += 1
 
         # -----------------------------
-        # FIX 5: CAP EXTREME LAP TIMES
+        # SAFETY CAR OVERRIDE
+        #
+        # Applied AFTER the sanity guard so a Safety Car lap is
+        # actually slow instead of being clipped back to green pace.
         # -----------------------------
-        lap_times = np.clip(
-            lap_times,
-            self.base - 1.5,
-            self.base + 2.0
-        )    
+        running = np.isfinite(self.total_time)
+
+        if safety == "SC":
+            lap_times[running] = self.sc_lap_time
+        elif safety == "VSC":
+            lap_times[running] = self.vsc_lap_time
 
         # -----------------------------
-        # APPLY LAP TIMES
+        # APPLY LAP TIMES + PIT LOSS
         # -----------------------------
-        self.total_time += lap_times
+        self.total_time += lap_times + pit_loss
 
         # -----------------------------
-        # PACE COMPRESSION 
-        # -----------------------------
-        valid_times = self.total_time[np.isfinite(self.total_time)]
-
-        if len(valid_times) > 0:
-            leader_time = np.min(valid_times)
-
-            for i in range(self.n):
-                if np.isfinite(self.total_time[i]):
-                    gap = self.total_time[i] - leader_time
-                    self.total_time[i] = leader_time + gap * 0.995
-
-        # -----------------------------
-        # TRAFFIC EFFECTS
+        # TRAFFIC EFFECTS (DIRTY AIR)
         # -----------------------------
         order = np.argsort(self.total_time)
 
@@ -306,6 +353,10 @@ class F1Env:
         # -----------------------------
         # OVERTAKES
         # -----------------------------
+        drs_coverage = self._drs_coverage()
+
+        order = np.argsort(self.total_time)
+
         for p in range(1, self.n):
 
             d = order[p]
@@ -314,20 +365,22 @@ class F1Env:
             if not np.isfinite(self.total_time[d]) or not np.isfinite(self.total_time[a]):
                 continue
 
+            # no overtaking under Safety Car
+            if safety in ("SC", "VSC"):
+                continue
+
             gap = self.total_time[d] - self.total_time[a]
 
             if gap > self.overtake_distance:
                 continue
 
-            # Check if in DRS zone
-            in_drs_zone = False
-
-            for start, end in self.drs_zones:
-                if start <= self.lap_progress[d] <= end:
-                    in_drs_zone = True
-                    break
+            # DRS is available if close enough AND the move happens
+            # to come in a DRS zone (weighted by how much of the lap
+            # this circuit's zones actually cover)
+            in_drs_zone = np.random.rand() < drs_coverage
 
             drs = 1 if (gap < self.drs_range and in_drs_zone) else 0
+
             delta = self.base[a] - self.base[d]
 
             prob = 1 / (1 + np.exp(-(-1.2 + 2.5 * delta + 2.5 * drs)))
@@ -336,26 +389,24 @@ class F1Env:
 
                 if np.random.rand() < prob:
 
-                    # ============================
-                    # CONTINUOUS OVERTAKE BOOST
-                    # ============================
-                    progress_boost = np.random.uniform(0.01, 0.03)
+                    # completed pass -- the attacker clears the car ahead
+                    gain = gap + np.random.uniform(0.05, 0.25)
 
-                    self.lap_progress[d] += progress_boost
+                    self.total_time[d] -= gain
+                    self.total_time[a] += np.random.uniform(0.05, 0.15)
 
-                    # If passes ahead car → complete overtake
-                    if self.lap_progress[d] > self.lap_progress[a]:
-
-                        gain = np.random.uniform(0.3, 0.8)
-
-                        self.total_time[d] -= gain
-                        self.total_time[a] += gain * 0.3
-
-                        overtake_events.append((self.drivers[d], self.drivers[a]))
+                    overtake_events.append((self.drivers[d], self.drivers[a]))
 
                 else:
                     # FAILED OVERTAKE
                     self.total_time[d] += np.random.uniform(0.1, 0.3)
+
+        # -----------------------------
+        # RECORD LAP COMPLETION
+        # -----------------------------
+        for i in range(self.n):
+            if np.isfinite(self.total_time[i]):
+                self.completion_times[i].append(float(self.total_time[i]))
 
         # -----------------------------
         # UPDATE POSITIONS
@@ -363,171 +414,104 @@ class F1Env:
         order = np.argsort(self.total_time)
         self.position[order] = np.arange(self.n)
 
-        # only increment lap when full lap completed
-        completed = self.lap_progress >= 1.0
+        # -----------------------------
+        # ADVANCE LAP COUNTER
+        # -----------------------------
+        self.lap += 1
 
-        self.lap += int(np.any(completed))
-        self.lap_progress[completed] -= 1.0
+        finite = self.total_time[np.isfinite(self.total_time)]
+        self.race_clock = float(np.min(finite)) if len(finite) else self.race_clock
 
         # -----------------------------
         # DONE
         # -----------------------------
-        done = self.lap >= getattr(self, "total_laps", 57)
+        done = (self.lap >= self.total_laps) or (len(finite) == 0)
 
         # -----------------------------
         # REWARD (can change later)
         # -----------------------------
         reward = -self.position
 
-        # -----------------------------
-        # UPDATE LAP PROGRESS
-        # -----------------------------
-
-        # progress increment based on pace
-        speed_factor = 1 / (lap_times + 1e-6)
-
-        # normalize speeds
-        speed_norm = speed_factor / np.max(speed_factor)
-
-        # update progress
-        self.lap_progress += speed_norm * 0.005
-
-        # wrap around lap
-        self.lap_progress = self.lap_progress % 1.0
-
         return self._get_state(), reward, done, {"overtakes": overtake_events}
+
+    # ==========================================================
+    # RENDERING: WHERE IS EACH CAR AT RACE TIME t ?
+    # ==========================================================
+    def positions_at(self, t=None):
+        """
+        Distance covered by each car, measured in laps, at race time t.
+
+        Returns a float array: 12.4 means "four tenths of the way
+        round lap 13". Sorting by this descending gives exactly the
+        running order, so the circuit view and the timing screen can
+        never disagree.
+        """
+
+        if t is None:
+            t = self.race_clock
+
+        dist = np.zeros(self.n)
+
+        for i in range(self.n):
+
+            ct = self.completion_times[i]
+
+            # retired -- freeze the car where it stopped
+            if self.retired_at[i] is not None:
+                dist[i] = float(self.retired_at[i])
+                continue
+
+            if not ct:
+                dist[i] = 0.0
+                continue
+
+            # laps fully completed by time t
+            k = bisect.bisect_right(ct, t)
+
+            if k == 0:
+                lap_start = 0.0
+                lap_dur = ct[0]
+            else:
+                lap_start = ct[k - 1]
+
+                if k < len(ct):
+                    lap_dur = ct[k] - ct[k - 1]
+                elif len(ct) > 1:
+                    lap_dur = ct[-1] - ct[-2]
+                else:
+                    lap_dur = ct[0]
+
+            if lap_dur <= 0:
+                frac = 0.0
+            else:
+                frac = (t - lap_start) / lap_dur
+
+            dist[i] = k + float(np.clip(frac, 0.0, 1.0))
+
+        return dist
+
+    def track_positions(self, t=None):
+        """Position around the circuit as a 0-1 fraction, for drawing."""
+
+        return self.positions_at(t) % 1.0
 
     # ==========================================================
     # STATE
     # ==========================================================
     def _get_state(self):
 
+        distance = self.positions_at()
+
         return {
             "lap": self.lap,
+            "total_laps": self.total_laps,
             "safety": self.safety_active,
             "position": self.position.copy(),
             "tire_age": self.stint_laps.copy(),
             "compound": self.compounds.copy(),
             "gaps": self.total_time.copy(),
-            "lap_progress": self.lap_progress.copy()
+            "distance": distance,
+            "lap_progress": distance % 1.0,
+            "race_clock": self.race_clock,
+            "retired": [r is not None for r in self.retired_at],
         }
-
-
-# ==============================================================
-# SIMPLE TEST (RUN THIS FILE DIRECTLY)
-# ==============================================================
-
-if __name__ == "__main__":
-
-    print("Testing F1Env...")
-
-    # IMPORT YOUR EXISTING FUNCTIONS
-    from FastF1_Data_Driven_Simulations import load_data, extract_tire_deg
-
-    df, sc, vsc = load_data()
-    deg = extract_tire_deg()
-
-    env = F1Env(df, sc, vsc, deg)
-
-    state = env.reset()
-
-    player_driver = "VER"  # change later dynamically
-    player_idx = list(env.drivers).index(player_driver)
-
-    # -----------------------------
-    # CHOOSE STARTING TIRE
-    # -----------------------------
-    start_tire = input("Choose starting tire (soft / medium / hard): ").lower()
-
-    if start_tire == "soft":
-        env.compounds[player_idx] = "Soft"
-    elif start_tire == "hard":
-        env.compounds[player_idx] = "Hard"
-    else:
-        env.compounds[player_idx] = "Medium"
-
-    done = False
-
-    while not done:
-
-        actions = [0] * len(df)
-
-        for i in range(len(df)):
-
-            if i == player_idx:
-                continue
-
-            age = state["tire_age"][i]
-            compound = state["compound"][i]
-
-            # random thresholds (THIS FIXES SYNCHRONIZATION)
-            soft_thresh = np.random.randint(10, 14)
-            medium_thresh = np.random.randint(20, 26)
-            hard_thresh = np.random.randint(32, 40)
-
-            if compound == "Soft" and age > soft_thresh:
-                actions[i] = 2  # soft → medium
-
-            elif compound == "Medium" and age > medium_thresh:
-                actions[i] = 3  # medium → hard
-
-            elif compound == "Hard" and age > hard_thresh:
-                actions[i] = 2  # hard → medium
-
-        user_input = input("Pit this lap? (0=no, 1=soft, 2=medium, 3=hard): ")
-        actions[player_idx] = int(user_input)
-
-        state, reward, done, _ = env.step(actions)
-
-        # -----------------------------
-        # 🚨 DNF CHECK (ADD HERE)
-        # -----------------------------
-        if not np.isfinite(state["gaps"][player_idx]):
-            print("\n💥 You DNF’d! Race over.")
-            break
-
-        # ==============================
-        # PRINT GAME INFO (ADD HERE)
-        # ==============================
-        print(f"\n--- LAP {state['lap']} ---")
-
-        print(f"Driver: {player_driver}")
-        print(f"Position: {state['position'][player_idx] + 1}")
-        print(f"Tire: {state['compound'][player_idx]}")
-        print(f"Tire Age: {state['tire_age'][player_idx]:.0f}")
-
-        sorted_idx = np.argsort(state["gaps"])
-        pos = np.where(sorted_idx == player_idx)[0][0]
-
-        if pos > 0:
-            ahead = sorted_idx[pos - 1]
-            gap_ahead = state["gaps"][player_idx] - state["gaps"][ahead]
-            print(f"Gap Ahead: {gap_ahead:.2f}s")
-
-        if pos < len(sorted_idx) - 1:
-            behind = sorted_idx[pos + 1]
-            gap_behind = state["gaps"][behind] - state["gaps"][player_idx]
-            print(f"Gap Behind: {gap_behind:.2f}s")
-
-    print("Race completed successfully")
-
-    # -----------------------------
-    # FINAL CLASSIFICATION
-    # -----------------------------
-    final_order = np.argsort(state["gaps"])
-
-    leader_time = state["gaps"][final_order[0]]
-
-    for pos, idx in enumerate(final_order):
-        driver = env.drivers[idx]
-
-        if np.isfinite(state["gaps"][idx]):
-
-            if pos == 0:
-                print(f"P1: {driver} (Winner)")
-            else:
-                gap = state["gaps"][idx] - leader_time
-                print(f"P{pos+1}: {driver} (+{gap:.2f}s)")
-
-        else:
-            print(f"P{pos+1}: {driver} (DNF)")
