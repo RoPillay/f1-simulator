@@ -19,6 +19,9 @@ cache/
 # Precomputed track data (regenerate with precomputing_track_data.py)
 tracks/
 
+# Cached driver/team ratings (regenerate with build_driver_features.py)
+features/
+
 # Streamlit
 .streamlit/secrets.toml
 
