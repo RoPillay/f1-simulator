@@ -200,9 +200,14 @@ if not st.session_state.running:
         rows = []
         for pos, i in enumerate(order):
             retired = not np.isfinite(state["gaps"][i])
+            started = int(state["grid"][i])
+            moved = started - pos
+
             rows.append({
                 "Pos": "DNF" if retired else pos + 1,
                 "Driver": env.drivers[i],
+                "Grid": started + 1,
+                "+/-": "-" if retired else (f"{moved:+d}" if moved else "="),
                 "Gap": "DNF" if retired else ("Leader" if pos == 0 else f"+{state['gaps'][i] - leader:.2f}s"),
                 "Tire": state["compound"][i],
             })
@@ -370,7 +375,15 @@ with col_right:
         order = np.argsort(state["gaps"])
         pos = int(np.where(order == player_idx)[0][0])
 
-        st.metric("Position", f"P{pos + 1}")
+        started = int(state["grid"][player_idx])
+        gained = started - pos
+
+        st.metric(
+            "Position",
+            f"P{pos + 1}",
+            delta=(f"{gained:+d}" if gained else None),
+        )
+        st.caption(f"Started P{started + 1}")
 
         compound = state["compound"][player_idx]
         age = int(state["tire_age"][player_idx])
