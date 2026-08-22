@@ -21,14 +21,21 @@ import numpy as np
 
 class F1Env:
 
-    def __init__(self, df, sc_prob, vsc_prob, deg_model, total_laps=57):
+    def __init__(self, df, sc_prob, vsc_prob, deg_model, total_laps=57,
+                 full_race_laps=None):
 
         # -----------------------------
         # DATA
         # -----------------------------
         self.df = df
+
+        # sc_prob / vsc_prob arrive as PER-RACE figures (the fraction of
+        # races that saw a Safety Car). They are converted to a per-lap
+        # deployment chance in step() -- rolling a per-race probability
+        # once per lap is what pinned the Safety Car on permanently.
         self.sc_prob = sc_prob
         self.vsc_prob = vsc_prob
+
         self.deg_model = deg_model
         self.drs_zones = []
 
@@ -39,6 +46,12 @@ class F1Env:
 
         self.n = len(self.drivers)
         self.total_laps = total_laps
+
+        # The rate at which Safety Cars appear is a property of the
+        # circuit, not of how long you chose to race. Dividing by the
+        # FULL scheduled distance keeps that rate constant, so a 25%
+        # race sees roughly a quarter as many interventions.
+        self.full_race_laps = full_race_laps or total_laps
 
         # -----------------------------
         # TIRE MODEL (same structure as your sim)
@@ -99,6 +112,7 @@ class F1Env:
 
         self.safety_active = None
         self.safety_timer = 0
+        self.last_safety = None
 
         self.total_time = np.zeros(self.n)
         self.position = np.arange(self.n)
@@ -173,6 +187,11 @@ class F1Env:
         # -----------------------------
         # SAFETY CAR / VSC
         # -----------------------------
+        ref_laps = max(self.full_race_laps, 1)
+
+        sc_lap_prob = float(np.clip(self.sc_prob / ref_laps, 0.0, 1.0))
+        vsc_lap_prob = float(np.clip(self.vsc_prob / ref_laps, 0.0, 1.0))
+
         if self.safety_timer > 0:
             safety = self.safety_active
             self.safety_timer -= 1
@@ -182,15 +201,19 @@ class F1Env:
         else:
             safety = None
 
-            if np.random.rand() < self.sc_prob:
+            if np.random.rand() < sc_lap_prob:
                 self.safety_active = "SC"
                 self.safety_timer = np.random.randint(3, 6)
                 safety = "SC"
 
-            elif np.random.rand() < self.vsc_prob:
+            elif np.random.rand() < vsc_lap_prob:
                 self.safety_active = "VSC"
                 self.safety_timer = np.random.randint(2, 4)
                 safety = "VSC"
+
+        # what actually governed THIS lap (safety_active may already
+        # have been cleared above on the lap the period expires)
+        self.last_safety = safety
 
         # -----------------------------
         # DNF CHECK (ONCE PER LAP)
@@ -505,7 +528,7 @@ class F1Env:
         return {
             "lap": self.lap,
             "total_laps": self.total_laps,
-            "safety": self.safety_active,
+            "safety": self.last_safety,
             "position": self.position.copy(),
             "tire_age": self.stint_laps.copy(),
             "compound": self.compounds.copy(),

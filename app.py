@@ -160,7 +160,7 @@ if start_button:
 
     df, sc, vsc, deg, full_laps, params = load_track_data(track_name)
 
-    env = F1Env(df, sc, vsc, deg, total_laps=race_laps)
+    env = F1Env(df, sc, vsc, deg, total_laps=race_laps, full_race_laps=full_laps)
     env.track_overtake_factor = params["overtake"]
     env.drs_zones = drs_for(track_name)
 
